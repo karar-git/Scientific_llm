@@ -35,17 +35,26 @@ copy .env.example .env          # then put your real OPENROUTER_API_KEY in .env
 python -m app.preprocess
 ```
 
+By default PDFs are converted with pypdf plus a heading-inference pass tuned to arXiv's
+regular section structure — fast and dependency-free. Optionally, `pip install marker-pdf`
+and set `USE_MARKER=true` to convert with marker instead (a deep-learning layout model:
+best-quality Markdown, but torch + ~2 GB of models and much slower on CPU). marker is
+deliberately not in `requirements.txt` so the deployed API image stays small.
+
 This runs four resumable stages (already-finished work is skipped on re-run):
 
 1. **download** — fetches the 30 paper PDFs listed in `data/papers_manifest.json` into `papers/`
-2. **convert** — extracts each PDF to cleaned text with pypdf into `data/markdown/`
-3. **chunk** — an LLM splits each paper into self-contained passages; metadata is attached in
-   Python and everything is written to `data/chunks.jsonl`
+2. **convert** — extracts each PDF to text (pypdf) and infers Markdown section headings
+   from arXiv's regular title patterns, into `data/markdown/`; set `USE_MARKER=true` to
+   use marker instead (see above).
+3. **chunk** — heading-based structural chunking: split at section headings, sub-split long
+   sections with overlap; metadata is attached in Python and everything is written to
+   `data/chunks.jsonl`. Instant, no API calls.
 4. **embed** — chunks are embedded and stored in a persistent Chroma collection (`.chroma/`)
 
 Useful flags: `--limit 2` (only the first 2 papers, good for a smoke run), `--stage chunk`
-(one stage only), `--force` (redo everything). Only stages 3 and 4 call OpenRouter; with
-the default models the full 30-paper indexing costs well under $1.
+(one stage only), `--force` (redo everything), `--redo id1,id2` (re-chunk specific papers).
+Only the embed stage calls OpenRouter — the full 30-paper indexing costs about a cent.
 
 ## Run the API
 
@@ -115,7 +124,7 @@ All settings live in `.env` (see `.env.example`): model names, retrieval `RETRIE
 `RERANK_K`, Chroma location, and `WEB_SEARCH_ENABLED` to turn the web fallback off entirely.
 
 **Model choice:** `OPENROUTER_MODEL` (default `deepseek/deepseek-v4-flash`) drives the
-agent, chunker, and reranker; any OpenRouter model that supports tool calling works.
+agent, reranker, and web judge; any OpenRouter model that supports tool calling works.
 `OPENROUTER_EMBEDDING_MODEL` (default `openai/text-embedding-3-small`) is used for
 indexing and query-time search — if you change it, re-run the embed stage, since vectors
 from different models are not comparable.
@@ -144,9 +153,9 @@ in [TESTING.md](TESTING.md).
 
 - No conversation memory: each `/ask` is independent, so follow-ups like "tell me more"
   without a topic get `needs_clarification`.
-- LLM chunking is slower and costs more tokens than a fixed-size splitter (trade-off
-  discussed in DESIGN.md); the stage is resumable so an interrupted run continues where it
-  stopped.
+- Chunking is structural (headings + size), not semantic. An earlier version chunked with
+  an LLM — nice passages, but far too slow to rebuild (~an hour per full run), so it was
+  replaced; the story is in DESIGN.md.
 - Keyword search is exact word matching, not BM25 — good for technical terms like "LoRA",
   not a general lexical ranker.
 - The web fallback depends on DuckDuckGo availability; when it fails the system degrades to

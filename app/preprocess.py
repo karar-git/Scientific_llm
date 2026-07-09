@@ -1,12 +1,12 @@
-"""Corpus pipeline: download arXiv PDFs -> Markdown -> LLM chunking -> metadata -> vector store.
+"""Corpus pipeline: download arXiv PDFs -> Markdown (marker) -> heading-based chunks -> vector store.
 
 Run everything:      python -m app.preprocess
 Smoke run:           python -m app.preprocess --limit 2
 Redo from scratch:   python -m app.preprocess --force
+Redo some papers:    python -m app.preprocess --stage chunk --redo fid,qlora
 
 Each stage is resumable: papers already downloaded, converted, or chunked are
-skipped unless --force is given. Only the chunking and embedding stages need
-an OpenRouter API key.
+skipped unless --force is given. Only the embedding stage needs an API key.
 """
 
 from __future__ import annotations
@@ -19,31 +19,20 @@ from pathlib import Path
 
 import httpx
 
-from app.models import PROJECT_ROOT, env, get_chat_model, get_vector_store, manifest_path, chunks_path, reset_chunk_cache
+from app.models import PROJECT_ROOT, env, env_flag, get_vector_store, manifest_path, chunks_path, reset_chunk_cache
 
 PAPERS_DIR = PROJECT_ROOT / "papers"
 MARKDOWN_DIR = PROJECT_ROOT / "data" / "markdown"
 
-# The LLM does the chunking: it re-emits the paper as retrieval-sized passages
-# separated by blank lines, so splitting them back apart is trivial and costs
-# no output-format tokens (unlike JSON).
-CHUNKER_SYSTEM_PROMPT = """You are a document chunker for a RAG system. You receive part of a research paper that was extracted from a PDF to plain text.
-
-Re-emit the text as retrieval chunks, following these rules exactly:
-1. A chunk is one self-contained passage about a single idea — usually one paragraph (roughly 60-250 words). Never cut a sentence in half.
-2. Copy the original wording verbatim. Do not summarize, rephrase, or add any commentary of your own.
-3. Separate consecutive chunks with exactly TWO blank lines (press enter three times). Do not use any other separator and do not number the chunks.
-4. When a chunk starts a new section of the paper (Abstract, Introduction, Method, Experiments, ...), make the section title the first line of that chunk, written as a Markdown heading: ## Section Name
-5. Skip content that is useless for retrieval: page headers/footers, author lists and affiliations, reference/bibliography entries, acknowledgements, and garbled PDF artifacts (broken math, orphaned figure/table fragments).
-6. Repair obvious PDF-extraction damage only: rejoin words hyphen-broken across lines and sentences split mid-line.
-
-Output the chunks and nothing else."""
-
-CHUNK_SEPARATOR = re.compile(r"\n[ \t]*\n[ \t]*\n+")
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
-REFERENCES = re.compile(r"^#{0,6}\s*(references|bibliography)\s*$", re.IGNORECASE | re.MULTILINE)
+HEADING_LINE = re.compile(r"^(#{1,6}\s+.+)$", re.MULTILINE)
 MIN_CHUNK_CHARS = 120
-SEGMENT_CHARS = 9000  # how much markdown we hand the chunker LLM per call
+
+
+def _letters(s: str) -> str:
+    """Lowercase letters only - makes matching immune to pypdf's small-caps
+    artifacts ('R EFERENCES', '1 I NTRODUCTION') and stray punctuation."""
+    return re.sub(r"[^a-z]", "", s.lower())
 
 
 def load_manifest(limit: int | None = None) -> list[dict]:
@@ -84,9 +73,9 @@ def download_papers(papers: list[dict], force: bool = False, attempts: int = 3) 
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: PDF -> text (pypdf) + light Python cleanup
-# (MarkItDown was tried first, but its pdfminer backend glued words together
-# on these LaTeX-built PDFs; pypdf extracts them cleanly.)
+# Stage 2: PDF -> Markdown. marker (deep-learning layout analysis) produces
+# real markdown with headings, which the chunker relies on; pypdf is the
+# plain-text fallback when marker is not installed.
 # ---------------------------------------------------------------------------
 
 LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl"}
@@ -104,52 +93,124 @@ def clean_markdown(text: str) -> str:
         text = text.replace(ligature, replacement)
     text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)  # rejoin words hyphen-broken across lines
-    match = None
-    for match in REFERENCES.finditer(text):  # keep the LAST references heading
-        pass
-    if match and match.start() > len(text) * 0.4:
-        text = text[: match.start()]
+    # cut everything after the last references/bibliography line (scanned from the
+    # end; letters-only match survives small-caps spacing like 'R EFERENCES')
+    lines = text.split("\n")
+    for i in range(len(lines) - 1, -1, -1):
+        if len(lines[i]) < 40 and _letters(lines[i]) in {"references", "bibliography"}:
+            if sum(len(l) + 1 for l in lines[:i]) > len(text) * 0.4:
+                text = "\n".join(lines[:i])
+            break
     text = re.sub(r"[ \t]{3,}", "  ", text)
     return text.strip()
 
 
+SECTION_KEYS = {
+    "abstract", "introduction", "relatedwork", "background", "preliminaries", "method",
+    "methods", "methodology", "approach", "experiment", "experiments", "experimentalsetup",
+    "results", "discussion", "analysis", "evaluation", "ablation", "ablations",
+    "ablationstudies", "conclusion", "conclusions", "limitations", "futurework",
+    "broaderimpact", "broaderimpacts", "ethicsstatement", "acknowledgment",
+    "acknowledgments", "acknowledgement", "acknowledgements",
+}
+# "3.1 Low-Rank Updates" and appendix-style "A Experimental Details"
+NUMBERED_TITLE = re.compile(r"(\d{1,2}|[A-Z])(\.\d+)*\.?\s+[A-Z][^.!?]{2,60}")
+
+
+def infer_headings(text: str) -> str:
+    """pypdf gives plain text with no structure; turn likely section-title lines into
+    Markdown headings so the heading-based chunker has real sections to split at.
+    arXiv papers are very regular: 'Abstract', '1 Introduction', '3.1 Low-Rank Updates'.
+    Letters-only matching survives small-caps artifacts ('1 I NTRODUCTION')."""
+    # pypdf text has no real markdown - any line-leading '#' is a table artifact
+    # ("# datasets: 7"); neutralize it so it can't masquerade as a heading
+    lines = [re.sub(r"^[ \t]*#+[ \t]*", "", line) for line in text.split("\n")]
+    stripped = [line.strip() for line in lines]
+
+    def numbered_title(i: int) -> bool:
+        s = stripped[i]
+        return bool(3 <= len(s) <= 70 and len(s.split()) <= 7
+                    and not s.endswith((".", ",", ":", ";", ")"))
+                    and NUMBERED_TITLE.fullmatch(s))
+
+    out = []
+    for i, line in enumerate(lines):
+        s = stripped[i]
+        key = _letters(s)
+        is_section_word = (3 <= len(s) <= 60
+                           and not s.endswith((".", ",", ":", ";", ")"))
+                           and (key in SECTION_KEYS or (key.startswith("appendix") and len(key) <= 12)))
+        # consecutive numbered lines are a list (or prompt example), not section titles
+        is_numbered = (numbered_title(i)
+                       and not (i > 0 and numbered_title(i - 1))
+                       and not (i + 1 < len(lines) and numbered_title(i + 1)))
+        out.append(f"## {s}" if (is_section_word or is_numbered) else line)
+    return "\n".join(out)
+
+
 def convert_papers(papers: list[dict], force: bool = False) -> None:
     MARKDOWN_DIR.mkdir(parents=True, exist_ok=True)
-    for paper in papers:
-        target = MARKDOWN_DIR / f"{paper['source_id']}.md"
-        if target.exists() and not force:
-            continue
+    todo = [p for p in papers if force or not (MARKDOWN_DIR / f"{p['source_id']}.md").exists()]
+    if not todo:
+        return
+
+    marker_converter = None
+    if env_flag("USE_MARKER"):
+        try:
+            from marker.converters.pdf import PdfConverter
+            from marker.models import create_model_dict
+            from marker.output import text_from_rendered
+
+            marker_converter = PdfConverter(artifact_dict=create_model_dict())
+        except ImportError:
+            print("USE_MARKER=true but marker-pdf is not installed - falling back to pypdf")
+
+    for paper in todo:
         pdf = PAPERS_DIR / f"{paper['source_id']}.pdf"
-        target.write_text(clean_markdown(pdf_to_text(pdf)), encoding="utf-8")
+        target = MARKDOWN_DIR / f"{paper['source_id']}.md"
+        if marker_converter is not None:
+            text = clean_markdown(text_from_rendered(marker_converter(str(pdf)))[0])
+        else:
+            text = infer_headings(clean_markdown(pdf_to_text(pdf)))
+        target.write_text(text, encoding="utf-8")
         print(f"converted {pdf.name} -> {target.name} ({target.stat().st_size // 1024} KB)")
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: LLM chunking + metadata
+# Stage 3: heading-based chunking. Split at markdown headings so each chunk is
+# (part of) one real section of the paper; long sections are sub-split at
+# paragraph boundaries with overlap. Deterministic and instant.
 # ---------------------------------------------------------------------------
 
-def segment_markdown(text: str, max_chars: int = SEGMENT_CHARS) -> list[str]:
-    """Split a long document at paragraph boundaries so each LLM call stays small."""
-    segments, current, size = [], [], 0
-    for paragraph in text.split("\n\n"):
-        if size + len(paragraph) > max_chars and current:
-            segments.append("\n\n".join(current))
-            current, size = [], 0
-        current.append(paragraph)
-        size += len(paragraph) + 2
-    if current:
-        segments.append("\n\n".join(current))
-    return segments
+def chunk_markdown(text: str, max_chars: int | None = None, overlap: int | None = None) -> list[str]:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+    max_chars = max_chars or int(env("CHUNK_SIZE", "1200"))
+    overlap = overlap if overlap is not None else int(env("CHUNK_OVERLAP", "150"))
 
-def split_llm_output(text: str) -> list[str]:
-    """Split the chunker LLM's output back into individual chunks."""
-    parts = [part.strip() for part in CHUNK_SEPARATOR.split(text) if part.strip()]
-    if len(parts) <= 1 and len(text) > 1500:
-        # the model separated chunks with a single blank line instead of two:
-        # a giant one-blob result is useless for retrieval, so fall back
-        parts = [part.strip() for part in re.split(r"\n[ \t]*\n+", text) if part.strip()]
-    return [part for part in parts if len(part) >= MIN_CHUNK_CHARS]
+    pieces = HEADING_LINE.split(text)
+    sections = [pieces[0]] if pieces[0].strip() else []
+    for heading, body in zip(pieces[1::2], pieces[2::2]):
+        sections.append(f"{heading}\n{body}")
+
+    chunks: list[str] = []
+    for section in sections:
+        section = section.strip()
+        if len(section) <= max_chars:
+            chunks.append(section)
+            continue
+        # sub-split the body only, then stamp the heading onto every sub-chunk
+        # so each chunk still carries its section title
+        first_line, _, body = section.partition("\n")
+        heading = first_line if HEADING_LINE.match(first_line) else None
+        if heading is None:
+            body = section
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=max_chars - (len(heading) + 1 if heading else 0),
+            chunk_overlap=overlap, separators=["\n\n", "\n", ". ", " "])
+        for sub in splitter.split_text(body):
+            chunks.append(f"{heading}\n{sub}" if heading else sub)
+    return [c.strip() for c in chunks if len(c.strip()) >= MIN_CHUNK_CHARS]
 
 
 def attach_metadata(paper: dict, chunk_texts: list[str]) -> list[dict]:
@@ -190,23 +251,16 @@ def chunk_papers(papers: list[dict], force: bool = False, redo: set[str] | None 
         path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
         done -= redo
 
-    llm = get_chat_model()
     with open(path, "a", encoding="utf-8") as out:
         for paper in papers:
             if paper["source_id"] in done:
                 continue
             markdown = (MARKDOWN_DIR / f"{paper['source_id']}.md").read_text(encoding="utf-8")
-            # segments are independent, so chunk them concurrently (order is preserved)
-            prompts = [[("system", CHUNKER_SYSTEM_PROMPT), ("human", segment)]
-                       for segment in segment_markdown(markdown)]
-            replies = llm.batch(prompts, config={"max_concurrency": int(env("CHUNK_CONCURRENCY", "8"))})
-            chunk_texts = [chunk for reply in replies for chunk in split_llm_output(str(reply.content))]
+            chunk_texts = chunk_markdown(markdown)
             for record in attach_metadata(paper, chunk_texts):
                 out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
             print(f"chunked {paper['source_id']}: {len(chunk_texts)} chunks ({len(markdown) // 1024} KB source)")
-            if len(chunk_texts) < max(3, len(markdown) // 12000):
-                print(f"  WARNING: suspiciously few chunks - consider: python -m app.preprocess --stage chunk --redo {paper['source_id']}")
     reset_chunk_cache()
 
 

@@ -50,30 +50,37 @@ that grounding really matters — the model must quote the paper, not its own me
 Four resumable stages; each skips work whose output already exists.
 
 1. **Download** — PDFs from `arxiv.org/pdf/<id>`, validated by the `%PDF` magic bytes.
-2. **Convert** — pypdf extracts each PDF to text. I tried Microsoft's MarkItDown first, but
-   its pdfminer backend glued words together ("Animportantparadigm...") on all 30 of these
-   LaTeX-built PDFs, which would have poisoned both embeddings and keyword search; pypdf
-   extracts them with correct spacing. Python cleanup then removes control characters,
-   replaces ligatures (ﬁ → fi), rejoins hyphen-broken words, normalizes line endings,
-   collapses whitespace runs, and cuts everything after the final References heading.
-3. **Chunk (LLM-based, the main design decision)** — a chunker prompt gives the whole
-   document (in ~9k-char segments, split at paragraph boundaries) to the LLM, which re-emits
-   it verbatim as self-contained passages of roughly 60–250 words, separated by blank lines.
-   Why an LLM instead of a fixed-size splitter: PDF extraction produces messy layout, and a
-   character-count splitter happily cuts sentences, tables, and ideas in half; a semantic
-   chunker returns passages that each carry one complete idea, which is exactly what you
-   want a retrieval hit to be. Two cost controls: the output format is plain text with
-   blank-line separators (not JSON — no schema tokens wasted, trivially split in Python),
-   and the LLM also drops boilerplate (headers/footers, author lists, reference entries) and
-   repairs hyphen-broken words as it goes. It additionally normalizes section titles to
-   Markdown headings, which is what makes the `section` metadata reliable.
-4. **Embed** — chunks go into a persistent Chroma collection with cosine similarity.
+2. **Convert** — pypdf extracts each PDF to text, then a heading-inference pass turns
+   likely section-title lines into Markdown headings, exploiting how regular arXiv papers
+   are: bare keywords ("Abstract", "Conclusion" — matched on letters only, so pypdf's
+   small-caps artifacts like "R EFERENCES" still match) and numbered titles ("3.1 Low-Rank
+   Updates"), while rejecting consecutive numbered lines (those are lists or prompt
+   examples, not sections). Tools I tried and rejected: Microsoft's MarkItDown glued words
+   together ("Animportantparadigm...") on all 30 of these LaTeX-built PDFs; marker produces
+   genuinely better Markdown via deep-learning layout analysis and is supported behind
+   `USE_MARKER=true`, but it needs torch plus ~2 GB of models and is far slower on CPU, so
+   the zero-dependency heuristic is the default. Python cleanup also removes control
+   characters, replaces ligatures (ﬁ → fi), rejoins hyphen-broken words, normalizes line
+   endings, collapses whitespace, and cuts everything after the final References heading.
+3. **Chunk (heading-based)** — the Markdown is split at heading lines, so each chunk is
+   (part of) one real section of the paper; sections longer than `CHUNK_SIZE` (1200 chars)
+   are sub-split at paragraph/sentence boundaries with `CHUNK_OVERLAP` (150) using
+   LangChain's `RecursiveCharacterTextSplitter`, and every sub-chunk gets its section
+   heading stamped on top so it stays self-describing. Fragments under 120 chars are
+   dropped. Honest history: my first implementation was LLM-based chunking — the model
+   re-emitted each paper as self-contained passages. The chunk quality was good, but
+   re-emitting a 2 MB corpus token-by-token took the better part of an hour per rebuild
+   and the model occasionally broke the separator format, silently producing giant blobs.
+   A deterministic structural splitter over marker's real headings is instant,
+   reproducible, and gives the same section metadata for free, so I replaced it.
+4. **Embed** — chunks go into a persistent Chroma collection with cosine similarity. This
+   is now the only stage that calls an API.
 
-Metadata is attached in **Python**, not by the LLM (zero tokens, deterministic): `source_id`
-(manifest slug), `title`, `section` (tracked from the headings the chunker emits),
-`source_url` (arXiv abstract page), `topic`, and `chunk_index` — the index is what makes
-neighbor expansion a simple slice at query time. Everything is written to
-`data/chunks.jsonl`, which doubles as the keyword-search index.
+Metadata is attached in **Python** (zero tokens, deterministic): `source_id` (manifest
+slug), `title`, `section` (from the real Markdown headings), `source_url` (arXiv abstract
+page), `topic`, and `chunk_index` — the index is what makes neighbor expansion a simple
+slice at query time. Everything is written to `data/chunks.jsonl`, which doubles as the
+keyword-search index.
 
 ## Retrieval and generation (`app/rag.py`)
 
@@ -100,9 +107,8 @@ neighbor expansion a simple slice at query time. Everything is written to
 - **LLM**: everything goes through OpenRouter's OpenAI-compatible API with a single key,
   which lets me pick models purely on price/quality. Default is
   `deepseek/deepseek-v4-flash` ($0.09 in / $0.18 out per M tokens): strong instruction
-  following with tool-calling and structured-output support, and cheap enough that
-  LLM-chunking the whole corpus costs well under a dollar. One model serves the agent,
-  chunker, reranker, and web judge to keep the setup simple; swapping is a one-line env
+  following with tool-calling and structured-output support. One model serves the agent,
+  reranker, and web judge to keep the setup simple; swapping is a one-line env
   change (`OPENROUTER_MODEL`) — e.g. `anthropic/claude-haiku-4.5` if stricter format
   adherence is ever needed, or `google/gemini-3.1-flash-lite` as a middle ground.
 
@@ -148,14 +154,15 @@ data/               manifest + generated chunks.jsonl (+ markdown cache, gitigno
 
 Four flat modules, on purpose. Each file is one complete concern you can read top to
 bottom; there are no single-method classes or indirection layers. The only classes are
-Pydantic schemas (structured LLM output and API contracts) and the two fakes, which must
-subclass LangChain interfaces.
+Pydantic schemas (structured LLM output and API contracts).
 
 ## Trade-offs and assumptions
 
-- **LLM chunking** costs ~2× the corpus size in tokens and is not byte-deterministic between
-  runs. Accepted: it's a one-time indexing cost on 30 papers, the stage is resumable per
-  paper, and chunk quality is what the whole pipeline stands on.
+- **Heading inference is a heuristic** — it recovers the big regular sections
+  (Introduction, Method, Experiments...) reliably on arXiv papers but can miss unusual
+  titles; ~1% of chunks end up with the generic "Front matter" label. marker
+  (`USE_MARKER=true`) removes that limitation at the cost of a torch install and ~2 GB of
+  models; the deployed API never needs either.
 - **Answer latency** is 3+ LLM calls for a corpus question (agent, rerank, answer). Fine for
   an assistant API; batch throughput was not a goal.
 - **No conversation memory** — each request is independent. "Tell me more" therefore asks
@@ -179,6 +186,6 @@ subclass LangChain interfaces.
 
 I used AI coding assistants (OpenAI Codex and Claude Code) to help write and refactor the
 implementation and documentation. The architecture and its decisions — RAG-as-a-tool
-routing, LLM chunking with blank-line separators and Python-side metadata, hybrid
+routing, marker conversion with heading-based chunking and Python-side metadata, hybrid
 vector+keyword retrieval with neighbor expansion, LLM reranking as the confidence gate, and
 the bounded web-search fallback — are my own design, and I reviewed and tested the code.

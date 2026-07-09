@@ -13,11 +13,10 @@ an API key is configured.
 
 | Test | What it proves |
 |---|---|
-| `test_split_llm_output_...` | chunker output splits on blank-line separators; fragments are dropped |
+| `test_chunk_markdown_...` (x3) | chunks split at section headings; long sections sub-split under the size cap with the heading stamped on; fragments are dropped |
 | `test_attach_metadata_...` | every chunk gets `source_id`, `title`, `section`, `source_url`; sections carry across heading-less chunks |
 | `test_clean_markdown_...` | references section and control characters are removed |
-| `test_segment_markdown_...` | long documents are split for the chunker without losing text |
-| `test_pdf_converts_to_usable_text` | a real downloaded paper extracts to clean, correctly-spaced text |
+| `test_pdf_extracts_to_usable_text` | a real downloaded paper extracts to clean, correctly-spaced text (pypdf fallback path) |
 | `test_keyword_search_...` / `test_expand_neighbors_...` | exact-match search ranks correctly; neighbor expansion returns prev/next chunks and handles paper boundaries |
 | `test_empty_question_...` (rag) | empty input short-circuits to `needs_clarification` without any model call |
 | `test_health_...` (api, live) | the index is loaded and reported |
