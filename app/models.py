@@ -58,7 +58,7 @@ def get_chat_model() -> BaseChatModel:
         model=env("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash"),
         api_key=openrouter_key(),
         base_url=OPENROUTER_BASE_URL,
-        timeout=90,
+        timeout=150,
     )
 
 
