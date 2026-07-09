@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from app.models import PROJECT_ROOT, get_chat_model, get_vector_store, manifest_path, chunks_path, reset_chunk_cache
+from app.models import PROJECT_ROOT, env, get_chat_model, get_vector_store, manifest_path, chunks_path, reset_chunk_cache
 
 PAPERS_DIR = PROJECT_ROOT / "papers"
 MARKDOWN_DIR = PROJECT_ROOT / "data" / "markdown"
@@ -196,10 +196,11 @@ def chunk_papers(papers: list[dict], force: bool = False, redo: set[str] | None 
             if paper["source_id"] in done:
                 continue
             markdown = (MARKDOWN_DIR / f"{paper['source_id']}.md").read_text(encoding="utf-8")
-            chunk_texts: list[str] = []
-            for segment in segment_markdown(markdown):
-                reply = llm.invoke([("system", CHUNKER_SYSTEM_PROMPT), ("human", segment)])
-                chunk_texts.extend(split_llm_output(str(reply.content)))
+            # segments are independent, so chunk them concurrently (order is preserved)
+            prompts = [[("system", CHUNKER_SYSTEM_PROMPT), ("human", segment)]
+                       for segment in segment_markdown(markdown)]
+            replies = llm.batch(prompts, config={"max_concurrency": int(env("CHUNK_CONCURRENCY", "8"))})
+            chunk_texts = [chunk for reply in replies for chunk in split_llm_output(str(reply.content))]
             for record in attach_metadata(paper, chunk_texts):
                 out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
