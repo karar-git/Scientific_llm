@@ -163,6 +163,14 @@ subclass LangChain interfaces.
   correct behavior for a stateless API.
 - **Keyword search is not BM25** — it's exact matching for rare technical terms, feeding the
   reranker. The reranker, not the raw score, makes the final call.
+- **LLM rerank vs a dedicated reranker** — a cross-encoder reranker (e.g. Cohere Rerank 4
+  Pro through OpenRouter's `/rerank` endpoint, or ZeroEntropy's zerank-2) would rank
+  candidates more accurately, but it only outputs scores: I would still need a separate
+  sufficiency judgment (a tuned score threshold, or another LLM call) to drive the
+  insufficient-information path. With ~15 candidates per question, one structured LLM call
+  does both jobs at once, so I kept it. Swapping a dedicated reranker in behind the same
+  interface — scores for ordering, a cheap LLM check for sufficiency — is the first
+  improvement I would make with more time.
 - The four robustness behaviors rely on the instruction-following of a strong model rather
   than hand-written detectors; with a much weaker model the tag protocol would need a
   fallback classifier.
