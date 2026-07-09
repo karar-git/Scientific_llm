@@ -165,9 +165,17 @@ Pydantic schemas (structured LLM output and API contracts).
   models; the deployed API never needs either.
 - **Answer latency** is 3+ LLM calls for a corpus question (agent, rerank, answer). Fine for
   an assistant API; batch throughput was not a goal.
-- **No conversation memory** — each request is independent. "Tell me more" therefore asks
-  for clarification instead of silently retrieving something random, which I consider the
-  correct behavior for a stateless API.
+- **No multi-turn chat (planned, not shipped)** — each request is independent. "Tell me
+  more" therefore asks for clarification instead of silently retrieving something random,
+  which is the correct behavior for a stateless API. Multi-turn conversation was part of
+  the plan, and the architecture was built so it stays cheap to add: the LangGraph state
+  already accumulates the conversation via `add_messages`, so the upgrade is attaching a
+  checkpointer (e.g. `MemorySaver`, or a SQLite/Postgres one in production) to
+  `graph.compile()`, accepting a `session_id` in the request, and passing it as the
+  `thread_id` — the agent would then resolve follow-ups like "tell me more" against the
+  previous turns before searching. I ran out of time to implement and properly test it
+  within the task window (this was built alongside a full-time job), so I kept the API
+  honestly stateless rather than shipping a half-tested chat mode.
 - **Keyword search is not BM25** — it's exact matching for rare technical terms, feeding the
   reranker. The reranker, not the raw score, makes the final call.
 - **LLM rerank vs a dedicated reranker** — a cross-encoder reranker (e.g. Cohere Rerank 4

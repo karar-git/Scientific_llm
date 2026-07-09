@@ -151,8 +151,12 @@ in [TESTING.md](TESTING.md).
 
 ## Known limitations
 
-- No conversation memory: each `/ask` is independent, so follow-ups like "tell me more"
-  without a topic get `needs_clarification`.
+- No multi-turn chat (yet): each `/ask` is independent, so follow-ups like "tell me more"
+  without a topic get `needs_clarification`. Multi-turn conversation was planned — the
+  LangGraph state already accumulates messages, so it mainly needs a checkpointer plus a
+  `session_id` on the request — but the task's time window (built alongside a full-time
+  job) didn't allow implementing and testing it properly, so the API ships stateless.
+  The exact upgrade path is in DESIGN.md.
 - Chunking is structural (headings + size), not semantic. An earlier version chunked with
   an LLM — nice passages, but far too slow to rebuild (~an hour per full run), so it was
   replaced; the story is in DESIGN.md.
