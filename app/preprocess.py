@@ -144,7 +144,12 @@ def segment_markdown(text: str, max_chars: int = SEGMENT_CHARS) -> list[str]:
 
 def split_llm_output(text: str) -> list[str]:
     """Split the chunker LLM's output back into individual chunks."""
-    return [part.strip() for part in CHUNK_SEPARATOR.split(text) if len(part.strip()) >= MIN_CHUNK_CHARS]
+    parts = [part.strip() for part in CHUNK_SEPARATOR.split(text) if part.strip()]
+    if len(parts) <= 1 and len(text) > 1500:
+        # the model separated chunks with a single blank line instead of two:
+        # a giant one-blob result is useless for retrieval, so fall back
+        parts = [part.strip() for part in re.split(r"\n[ \t]*\n+", text) if part.strip()]
+    return [part for part in parts if len(part) >= MIN_CHUNK_CHARS]
 
 
 def attach_metadata(paper: dict, chunk_texts: list[str]) -> list[dict]:
@@ -169,7 +174,7 @@ def attach_metadata(paper: dict, chunk_texts: list[str]) -> list[dict]:
     return records
 
 
-def chunk_papers(papers: list[dict], force: bool = False) -> None:
+def chunk_papers(papers: list[dict], force: bool = False, redo: set[str] | None = None) -> None:
     path = chunks_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     done: set[str] = set()
@@ -178,6 +183,12 @@ def chunk_papers(papers: list[dict], force: bool = False) -> None:
             done = {json.loads(line)["source_id"] for line in fh if line.strip()}
     elif force:
         path.unlink(missing_ok=True)
+    if redo and path.exists():
+        # drop the redo papers' existing chunks so they get re-chunked fresh
+        keep = [line for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and json.loads(line)["source_id"] not in redo]
+        path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+        done -= redo
 
     llm = get_chat_model()
     with open(path, "a", encoding="utf-8") as out:
@@ -192,7 +203,9 @@ def chunk_papers(papers: list[dict], force: bool = False) -> None:
             for record in attach_metadata(paper, chunk_texts):
                 out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
-            print(f"chunked {paper['source_id']}: {len(chunk_texts)} chunks")
+            print(f"chunked {paper['source_id']}: {len(chunk_texts)} chunks ({len(markdown) // 1024} KB source)")
+            if len(chunk_texts) < max(3, len(markdown) // 12000):
+                print(f"  WARNING: suspiciously few chunks - consider: python -m app.preprocess --stage chunk --redo {paper['source_id']}")
     reset_chunk_cache()
 
 
@@ -234,6 +247,8 @@ def main() -> None:
                         help="run a single stage instead of all four")
     parser.add_argument("--if-empty", action="store_true",
                         help="skip embedding when the vector index already matches chunks.jsonl (used at deploy boot)")
+    parser.add_argument("--redo", default="",
+                        help="comma-separated source_ids to re-chunk (e.g. --redo fid,qlora)")
     args = parser.parse_args()
 
     papers = load_manifest(args.limit)
@@ -243,7 +258,7 @@ def main() -> None:
     if "convert" in stages:
         convert_papers(papers, args.force)
     if "chunk" in stages:
-        chunk_papers(papers, args.force)
+        chunk_papers(papers, args.force, {s.strip() for s in args.redo.split(",") if s.strip()})
     if "embed" in stages:
         embed_chunks(skip_if_current=args.if_empty)
     print("done")
